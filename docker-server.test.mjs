@@ -370,6 +370,23 @@ it('strips the browser Origin and Referer before forwarding to the API', async (
   });
 });
 
+it('strips hop-by-hop headers before forwarding to the API', async () => {
+  await withProxyServer(async (port, upstream) => {
+    await rawRequest(port, '/api/info', {
+      headers: {
+        'keep-alive': 'timeout=5',
+        upgrade: 'h2c',
+        'proxy-authorization': 'Basic abc',
+        te: 'trailers',
+      },
+    });
+    assert.equal(upstream.received.headers['keep-alive'], undefined);
+    assert.equal(upstream.received.headers.upgrade, undefined);
+    assert.equal(upstream.received.headers['proxy-authorization'], undefined);
+    assert.equal(upstream.received.headers.te, undefined);
+  });
+});
+
 it('does NOT proxy non-/api routes (still serves the SPA)', async () => {
   await withProxyServer(async (port, upstream) => {
     const res = await rawRequest(port, '/some/app/route');
@@ -439,6 +456,34 @@ it('serves RENDER_EXTERNAL_URL as the backend origin when GITNEXUS_BACKEND_URL i
       assert.ok(res.body.includes('https://gitnexus-web.onrender.com'));
     },
   );
+});
+
+it('returns 504 when the upstream does not respond within the timeout', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'gitnexus-proxy-timeout-'));
+  await mkdir(join(dir, 'dist'), { recursive: true });
+  await writeFile(join(dir, 'dist', 'index.html'), '<html><body>spa</body></html>');
+
+  // Upstream accepts the connection but never responds — an idle hang.
+  const upstreamServer = createServer(() => {});
+  const upstreamPort = await new Promise((resolve) => {
+    upstreamServer.listen(0, '127.0.0.1', () => resolve(upstreamServer.address().port));
+  });
+
+  const port = await getFreePort();
+  const proc = spawnServerWithEnv(dir, port, {
+    GITNEXUS_UPSTREAM_URL: `http://127.0.0.1:${upstreamPort}`,
+    GITNEXUS_PROXY_TIMEOUT_MS: '300',
+  });
+  try {
+    await waitForServer(port);
+    const res = await rawRequest(port, '/api/info');
+    assert.equal(res.status, 504);
+  } finally {
+    await killAndWait(proc);
+    upstreamServer.closeAllConnections?.();
+    await new Promise((r) => upstreamServer.close(r));
+    await rm(dir, { recursive: true, force: true });
+  }
 });
 
 it('returns 502 when the upstream is unreachable', async () => {
