@@ -4,6 +4,8 @@ Deploy [GitNexus](https://github.com/abhigyanpatwari/GitNexus) on Render in one 
 
 [![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy?repo=https://github.com/Ho1yShif/GitNexus)
 
+https://github.com/user-attachments/assets/5597a2f2-6bfd-40f9-9247-718dbbab72bf
+
 ## What it does
 
 GitNexus parses a codebase into a graph of symbols and relationships and exposes it through a web UI: index a repo, browse the call/inheritance graph, search execution flows, and run impact analysis ("what breaks if I change this?"). The core needs **no API key** — everything in this deploy runs on the code graph alone.
