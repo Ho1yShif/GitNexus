@@ -10,6 +10,7 @@ import type { GraphNode, GraphRelationship } from 'gitnexus-shared';
 import { CircuitOpenError, ResilientFetchExhaustedError, resilientFetch } from 'gitnexus-shared';
 import { LARGE_GRAPH_NODE_THRESHOLD, LARGE_GRAPH_EDGE_THRESHOLD } from '../config/ui-constants';
 import { decideSkipGraph } from '../lib/graph-load-decision';
+import { getDemoSessionId } from './demo-session';
 
 // ── Types ──────────────────────────────────────────────────────────────────
 
@@ -26,6 +27,12 @@ export interface BackendRepo {
     communities?: number;
     processes?: number;
   };
+  /**
+   * Demo mode only: true when the current browser session added this repo (so
+   * the UI may offer delete / re-analyze). Absent/false for seed repos and
+   * outside demo mode.
+   */
+  demoOwned?: boolean;
 }
 
 /**
@@ -327,6 +334,12 @@ const fetchWithTimeout = async (
   const isIdempotent = IDEMPOTENT_METHODS.has(method);
   const maxAttempts = isIdempotent || forceRetry ? 2 : 1;
 
+  // Identify this browser session so the server can scope demo-mode repos to it.
+  // Sent on every request (harmless outside demo mode, where it is ignored).
+  const headers = new Headers(init.headers);
+  headers.set('X-GitNexus-Session', getDemoSessionId());
+  init = { ...init, headers };
+
   // Key the breaker by the current backend origin so switching backend
   // URLs (e.g. recovering from a flapping local server by pointing at
   // a different host) gives the new origin a fresh breaker state. A
@@ -451,6 +464,8 @@ export interface ServerInfo {
   version: string;
   launchContext: 'npx' | 'global' | 'local';
   nodeVersion: string;
+  /** Read-only demo mode — when true, mutation endpoints are blocked server-side. */
+  demo: boolean;
 }
 
 /** Fetch server info (version, launch context). */
@@ -458,6 +473,27 @@ export const fetchServerInfo = async (): Promise<ServerInfo> => {
   const response = await fetchWithTimeout(`${_backendUrl}/api/info`);
   await assertOk(response);
   return response.json() as Promise<ServerInfo>;
+};
+
+/**
+ * Ask the demo server to erase every repo this browser session added. Fired on
+ * tab close/hide via navigator.sendBeacon, which cannot set headers — so the
+ * session id travels as a query param. Best-effort and non-blocking; the server
+ * also sweeps idle sessions as a backstop. No-op outside demo mode.
+ */
+export const endDemoSession = (): void => {
+  try {
+    const url = `${_backendUrl}/api/demo/end-session?session=${encodeURIComponent(getDemoSessionId())}`;
+    if (typeof navigator !== 'undefined' && typeof navigator.sendBeacon === 'function') {
+      navigator.sendBeacon(url);
+    } else {
+      // Fallback for environments without sendBeacon; keepalive lets it outlive
+      // the page. Fire-and-forget — failures during unload are unobservable.
+      void fetch(url, { method: 'POST', keepalive: true }).catch(() => {});
+    }
+  } catch {
+    /* unload path — nothing actionable */
+  }
 };
 
 /**
