@@ -338,7 +338,6 @@ const fetchWithTimeout = async (
   // Sent on every request (harmless outside demo mode, where it is ignored).
   const headers = new Headers(init.headers);
   headers.set('X-GitNexus-Session', getDemoSessionId());
-  init = { ...init, headers };
 
   // Key the breaker by the current backend origin so switching backend
   // URLs (e.g. recovering from a flapping local server by pointing at
@@ -361,7 +360,7 @@ const fetchWithTimeout = async (
     // single-attempt to avoid duplicate side effects.
     const response = await resilientFetch(
       url,
-      { ...init, signal },
+      { ...init, headers, signal },
       {
         breakerKey,
         retry: { maxAttempts, baseDelayMs: 250, capDelayMs: 1500 },
