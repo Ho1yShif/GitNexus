@@ -30,6 +30,7 @@ import {
   streamQuery,
   flushWAL,
   closeLbug,
+  closeLbugIfOpen,
   withLbugDb,
   isReadOnlyDbError,
   isQueryCompileError,
@@ -935,8 +936,16 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
   // holds the repo lock (or that no analyze/embed is in flight). Never throws on
   // missing files; a delete of already-gone data is a no-op.
   const eraseRepo = async (entry: RegistryEntry): Promise<void> => {
+    // Release the shared query handle only if it currently has THIS repo open.
+    // That handle is a switch-on-demand cache for the direct query routes, so a
+    // repo that isn't the open one holds no handle here and its files rm cleanly
+    // without a close. Closing unconditionally would abort an unrelated in-flight
+    // query on another repo — a real hazard under demo mode's concurrent visitors
+    // plus the idle sweep, which erases one session's repo while others browse
+    // seed repos. (`backend.init()` below still refreshes the pool + registry for
+    // every erase; only the global-handle close is now scoped.)
     try {
-      await closeLbug();
+      await closeLbugIfOpen(path.join(entry.storagePath, 'lbug'));
     } catch {}
     // 1. Index/storage dir.
     await fs.rm(getStoragePath(entry.path), { recursive: true, force: true }).catch(() => {});
