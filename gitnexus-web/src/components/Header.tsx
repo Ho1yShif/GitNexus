@@ -257,6 +257,11 @@ export const Header = ({
                             filteredRepos.map((repo) => {
                               const identity = repoIdentity(repo);
                               const isActive = identity === activeRepoIdentity;
+                              // Mutation controls (re-analyze / delete) show outside demo
+                              // mode, or in demo mode only for repos this session added.
+                              // Seed repos and other sessions' repos are read-only (the
+                              // server also 403s these mutations — this just hides them).
+                              const canMutate = !demo || repo.demoOwned;
 
                               return (
                                 <div
@@ -288,7 +293,7 @@ export const Header = ({
                                     )}
                                   </button>
                                   {/* Re-analyze — in demo mode, only for repos this session added */}
-                                  {(!demo || repo.demoOwned) && (
+                                  {canMutate && (
                                     <button
                                       data-testid="repo-switcher-reanalyze"
                                       onClick={async (e) => {
@@ -345,7 +350,7 @@ export const Header = ({
                                     </button>
                                   )}
                                   {/* Delete — in demo mode, only for repos this session added */}
-                                  {(!demo || repo.demoOwned) && (
+                                  {canMutate && (
                                     <button
                                       data-testid="repo-switcher-delete"
                                       onClick={async (e) => {
