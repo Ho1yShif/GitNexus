@@ -11,6 +11,7 @@
  */
 
 import path from 'path';
+import os from 'node:os';
 import { existsSync, statSync } from 'node:fs';
 import { fork } from 'child_process';
 import { fileURLToPath, pathToFileURL } from 'url';
@@ -22,6 +23,8 @@ import {
   listRegisteredRepos,
   registryPathEquals,
 } from '../storage/repo-manager.js';
+import { heapCapMb, readConstrainedBytes } from '../core/memory.js';
+import { parsePositiveIntEnv } from '../core/ingestion/utils/env.js';
 import { logger } from '../core/logger.js';
 import type { JobManager } from './analyze-job.js';
 import type { WorkerMessage } from './analyze-worker.js';
@@ -49,6 +52,54 @@ export interface LaunchOptions {
 }
 
 const MAX_WORKER_RETRIES = 2;
+
+/** Floor for the auto-sized worker heap cap — the sizer never goes below this,
+ *  so a tiny or misreported memory limit still leaves the worker a workable
+ *  heap. Unlike the CLI's DEFAULT_HEAP_MB (16384), this is a small container
+ *  floor: the server is meant to run in a memory-limited instance. */
+const WORKER_HEAP_FLOOR_MB = 1024;
+
+/**
+ * Container-aware old-space heap ceiling (MB) for the forked analyze worker.
+ * Thin wrapper over the shared {@link heapCapMb} that pins the small
+ * {@link WORKER_HEAP_FLOOR_MB} (vs the CLI's 16 GB floor).
+ *
+ * The ceiling MUST stay BELOW the container's real memory limit. A ceiling above
+ * available RAM (the old hardcoded `8192` on a 2 GB instance) makes the cgroup
+ * OOM-killer fire on a large repo BEFORE V8 reaches its own recoverable
+ * "JavaScript heap out of memory" — killing the parent server (PID 1) and the
+ * whole service, instead of just this worker. Sized to the container it stays
+ * contained: V8 aborts the child, `child.on('exit')` retries up to
+ * MAX_WORKER_RETRIES, and an exhausted job fails cleanly while the server (and
+ * every other job) stays up.
+ */
+export function computeWorkerHeapCapMb(
+  totalBytes: number,
+  constrainedBytes: number | null,
+): number {
+  return heapCapMb(totalBytes, constrainedBytes, WORKER_HEAP_FLOOR_MB);
+}
+
+/**
+ * Resolve the worker heap ceiling (MB): an explicit, valid positive-integer
+ * operator override (`GITNEXUS_SERVER_WORKER_MAX_OLD_SPACE_MB`) wins; an unset
+ * or invalid value falls back to the container-aware auto-size
+ * ({@link computeWorkerHeapCapMb}). Pure (env value passed in) so the override
+ * precedence is unit-testable.
+ */
+export function resolveWorkerHeapCapMb(
+  overrideRaw: string | undefined,
+  totalBytes: number,
+  constrainedBytes: number | null,
+): number {
+  return parsePositiveIntEnv(overrideRaw) ?? computeWorkerHeapCapMb(totalBytes, constrainedBytes);
+}
+
+const WORKER_MAX_OLD_SPACE_MB = resolveWorkerHeapCapMb(
+  process.env.GITNEXUS_SERVER_WORKER_MAX_OLD_SPACE_MB,
+  os.totalmem(),
+  readConstrainedBytes(),
+);
 
 /**
  * The worker reports `complete` over IPC before its on-disk finalization
@@ -156,7 +207,7 @@ export function createLaunchAnalysisWorker(deps: LaunchDeps) {
       if (!currentJob || currentJob.status === 'complete' || currentJob.status === 'failed') return;
 
       const child = fork(workerPath, [], {
-        execArgv: [...tsxHookArgs, '--max-old-space-size=8192'],
+        execArgv: [...tsxHookArgs, `--max-old-space-size=${WORKER_MAX_OLD_SPACE_MB}`],
         stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
       });
 
