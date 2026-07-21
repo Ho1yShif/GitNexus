@@ -86,6 +86,40 @@ const request = (
     req.end();
   });
 
+// POST an `application/x-www-form-urlencoded` body — mirrors how the web app's
+// end-session beacon sends the session id (in the body, never the URL query
+// string, so it can't leak into access logs).
+const postForm = (port: number, routePath: string, form: Record<string, string>): Promise<Reply> =>
+  new Promise((resolve, reject) => {
+    const data = new URLSearchParams(form).toString();
+    const req = http.request(
+      {
+        host: '127.0.0.1',
+        port,
+        method: 'POST',
+        path: routePath,
+        headers: {
+          'content-type': 'application/x-www-form-urlencoded',
+          'content-length': String(Buffer.byteLength(data)),
+        },
+      },
+      (res) => {
+        const chunks: Buffer[] = [];
+        res.on('data', (c) => chunks.push(c));
+        res.on('end', () =>
+          resolve({ status: res.statusCode ?? 0, body: Buffer.concat(chunks).toString('utf8') }),
+        );
+      },
+    );
+    req.on('error', reject);
+    req.setTimeout(5_000, () => {
+      req.destroy();
+      reject(new Error(`POST ${routePath} timed out`));
+    });
+    req.write(data);
+    req.end();
+  });
+
 // Seed one registered repo into `homeDir` so the spawned server sees a seed
 // (pre-indexed, unowned) repo. Uses the storage helpers directly — no analysis —
 // which is enough for the guard assertions (they never open the graph). Restores
@@ -239,12 +273,14 @@ describeDemo('gitnexus serve — demo mode (DEMO)', () => {
       const search = await request(port, 'POST', '/api/search', { query: 'x' }, session);
       expect(search.status).not.toBe(403);
 
-      // The end-session endpoint exists and accepts the session via header or query.
+      // The end-session endpoint exists and accepts the session via header or,
+      // for the sendBeacon path (which can't set headers), a form body.
       const endHeader = await request(port, 'POST', '/api/demo/end-session', undefined, session);
       expect(endHeader.status).toBe(200);
       expect(JSON.parse(endHeader.body).ok).toBe(true);
-      const endQuery = await request(port, 'POST', '/api/demo/end-session?session=sess-beta');
-      expect(endQuery.status).toBe(200);
+      const endBody = await postForm(port, '/api/demo/end-session', { session: 'sess-beta' });
+      expect(endBody.status).toBe(200);
+      expect(JSON.parse(endBody.body).ok).toBe(true);
     } finally {
       fs.rmSync(seedDir, { recursive: true, force: true });
     }

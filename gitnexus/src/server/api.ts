@@ -982,6 +982,16 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
     return repos.find((r) => registryPathEquals(canonicalizePath(path.resolve(r.path)), target));
   };
 
+  // Resolve the local clone directory a git URL will be analyzed (and
+  // registered) in. Both the demo-mode ownership claim — which MUST key on the
+  // exact path the worker registers, or the repo surfaces as an unowned seed
+  // repo — and the worker's own clone step derive the path through this one
+  // function, so the two can never drift.
+  const cloneTargetForUrl = (repoUrl: string): { repoName: string; cloneDir: string } => {
+    const repoName = extractRepoName(repoUrl);
+    return { repoName, cloneDir: getCloneDir(repoName) };
+  };
+
   // In demo mode, claim a repo for a session at the moment its analysis starts,
   // keyed by the directory the worker will analyze (which the registry keys the
   // entry by). Claiming eagerly — rather than on job completion — means the repo
@@ -1250,12 +1260,16 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
       '/api/demo/end-session',
       createRouteLimiter(),
       requireLocalhostOrigin,
+      // The beacon posts the session id in a small form body (parsed here);
+      // scoped to this route so global body parsing is unchanged.
+      express.urlencoded({ extended: false, limit: '1kb' }),
       async (req, res) => {
-        // Accept the session id from the header OR a `?session=` query param:
-        // navigator.sendBeacon (fired on tab close) cannot set custom headers.
-        const rawQuery = req.query.session;
-        const querySession = isValidDemoSessionId(rawQuery) ? rawQuery : undefined;
-        const sessionId = getSessionId(req) ?? querySession;
+        // Accept the session id from the header OR the form body. navigator.
+        // sendBeacon (fired on tab close) cannot set custom headers, so it
+        // sends the id in the body — never the URL query string, which would
+        // leak an ownership key into access/proxy logs.
+        const bodySession = isValidDemoSessionId(req.body?.session) ? req.body.session : undefined;
+        const sessionId = getSessionId(req) ?? bodySession;
         if (sessionId) {
           try {
             await eraseDemoSession(sessionId);
@@ -1820,13 +1834,14 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
         // session below), but re-analyzing an *existing* repo is blocked unless
         // the caller owns it — protecting seed repos (and other sessions' repos)
         // from being clobbered. `demoTargetPath` is the directory the worker will
-        // analyze, reused as the ownership key so the claim matches the registry.
+        // analyze, reused as the ownership key so the claim matches the registry
+        // (derived via the shared cloneTargetForUrl so it can't drift).
         let demoTargetPath: string | undefined;
         if (demoStore) {
           demoTargetPath = repoLocalPath;
           if (!demoTargetPath && repoUrl) {
             try {
-              demoTargetPath = getCloneDir(extractRepoName(repoUrl));
+              demoTargetPath = cloneTargetForUrl(repoUrl).cloneDir;
             } catch {
               /* unresolvable name — fall through, worker surfaces the error */
             }
@@ -1874,8 +1889,8 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
           try {
             // Clone if URL provided
             if (repoUrl && !repoLocalPath) {
-              const repoName = extractRepoName(repoUrl);
-              targetPath = getCloneDir(repoName);
+              const { repoName, cloneDir } = cloneTargetForUrl(repoUrl);
+              targetPath = cloneDir;
 
               jobManager.updateJob(job.id, {
                 status: 'cloning',

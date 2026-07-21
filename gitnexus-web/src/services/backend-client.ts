@@ -489,19 +489,27 @@ export const syncDemoMode = (setDemo: (demo: boolean) => void): void => {
 
 /**
  * Ask the demo server to erase every repo this browser session added. Fired on
- * tab close/hide via navigator.sendBeacon, which cannot set headers — so the
- * session id travels as a query param. Best-effort and non-blocking; the server
- * also sweeps idle sessions as a backstop. No-op outside demo mode.
+ * tab close/hide. The session id rides in the request body — not the URL query
+ * string — so it never lands in access/proxy logs: navigator.sendBeacon (which
+ * cannot set headers) sends it as `application/x-www-form-urlencoded` (a
+ * CORS-safelisted type, so no preflight); the fetch fallback uses the header.
+ * Best-effort and non-blocking; the server also sweeps idle sessions as a
+ * backstop. No-op outside demo mode.
  */
 export const endDemoSession = (): void => {
   try {
-    const url = `${_backendUrl}/api/demo/end-session?session=${encodeURIComponent(getDemoSessionId())}`;
+    const url = `${_backendUrl}/api/demo/end-session`;
+    const session = getDemoSessionId();
     if (typeof navigator !== 'undefined' && typeof navigator.sendBeacon === 'function') {
-      navigator.sendBeacon(url);
+      navigator.sendBeacon(url, new URLSearchParams({ session }));
     } else {
       // Fallback for environments without sendBeacon; keepalive lets it outlive
       // the page. Fire-and-forget — failures during unload are unobservable.
-      void fetch(url, { method: 'POST', keepalive: true }).catch(() => {});
+      void fetch(url, {
+        method: 'POST',
+        keepalive: true,
+        headers: { 'X-GitNexus-Session': session },
+      }).catch(() => {});
     }
   } catch {
     /* unload path — nothing actionable */
