@@ -611,6 +611,54 @@ it('returns 502 after exhausting the retry budget when the upstream stays down',
   }
 });
 
+it('does NOT retry a POST that connects then resets before responding', async () => {
+  // The upstream accepts the connection, reads the whole request, then dies
+  // before sending any response byte — an instance that received the job and
+  // crashed/restarted mid-flight. Because the reset arrives AFTER connecting and
+  // POST is non-idempotent, replaying could run the job twice, so the proxy must
+  // NOT retry: the upstream sees exactly one call and the browser gets 502.
+  const dir = await mkdtemp(join(tmpdir(), 'gitnexus-proxy-postreset-'));
+  await mkdir(join(dir, 'dist'), { recursive: true });
+  await writeFile(join(dir, 'dist', 'index.html'), '<html><body>spa</body></html>');
+
+  let calls = 0;
+  const upstreamServer = createServer((req, res) => {
+    calls += 1;
+    req.on('data', () => {});
+    req.on('end', () => res.socket.destroy()); // received the job, then die
+  });
+  const upstreamPort = await new Promise((resolve) => {
+    upstreamServer.listen(0, '127.0.0.1', () => resolve(upstreamServer.address().port));
+  });
+
+  const port = await getFreePort();
+  const proc = spawnServerWithEnv(dir, port, {
+    GITNEXUS_UPSTREAM_URL: `http://127.0.0.1:${upstreamPort}`,
+    GITNEXUS_PROXY_RETRY_ATTEMPTS: '3',
+  });
+  try {
+    await waitForServer(port);
+    const res = await rawRequest(port, '/api/analyze', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: '{"repo":"x"}',
+    });
+    assert.equal(res.status, 502, 'post-connection reset on a POST fails fast, no retry');
+    // Give any (erroneous) retry a chance to fire before asserting.
+    await new Promise((r) => setTimeout(r, 300));
+    assert.equal(
+      calls,
+      1,
+      'non-idempotent POST must not be replayed after the upstream received it',
+    );
+  } finally {
+    await killAndWait(proc);
+    upstreamServer.closeAllConnections?.();
+    await new Promise((r) => upstreamServer.close(r));
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 it('does NOT retry after the upstream starts streaming, then drops mid-body', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'gitnexus-proxy-midbody-'));
   await mkdir(join(dir, 'dist'), { recursive: true });
@@ -736,8 +784,10 @@ it('returns 400 when the client declares a body but never finishes sending it', 
   const port = await getFreePort();
   const proc = spawnServerWithEnv(dir, port, {
     GITNEXUS_UPSTREAM_URL: `http://127.0.0.1:${upstreamPort}`,
-    // Small body-read budget so a stalled client trips the timeout quickly.
-    GITNEXUS_PROXY_TIMEOUT_MS: '300',
+    // Small body-read budget so a stalled client trips the timeout quickly. Set
+    // via the dedicated knob (leaving the upstream idle timeout at its default)
+    // to prove the two are tuned independently.
+    GITNEXUS_PROXY_CLIENT_BODY_TIMEOUT_MS: '300',
   });
 
   // Raw socket (not http.request, which would auto-finish the body): send a

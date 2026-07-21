@@ -71,27 +71,43 @@ const upstreamBase = validHttpUrl('GITNEXUS_UPSTREAM_URL', rawUpstreamUrl);
 // resets it, so long-lived streams are unaffected. 0 disables the timeout.
 const proxyTimeoutMs = Number(process.env.GITNEXUS_PROXY_TIMEOUT_MS || '120000');
 
+// How long the proxy will wait to buffer a replayable client body before giving
+// up with 400 — the reverse-proxy equivalent of nginx's client_body_timeout.
+// Defaults to proxyTimeoutMs so the single-knob setup still works, but can be
+// tuned independently of the upstream idle timeout. 0 disables it (Node's
+// server requestTimeout remains the outer backstop).
+const proxyClientBodyTimeoutMs = Number(
+  process.env.GITNEXUS_PROXY_CLIENT_BODY_TIMEOUT_MS || String(proxyTimeoutMs),
+);
+
 // Bounded connection-retry for proxied requests. A single-instance upstream
 // (e.g. the Render private server with a disk, which can't do zero-downtime
 // deploys) has a few-second window during every restart/redeploy where the old
 // instance is gone and the new one hasn't bound its port or propagated its
-// internal DNS name yet. A connect-level failure in that window (ECONNRESET
-// "socket hang up", ENOTFOUND, ECONNREFUSED, EAI_AGAIN, ETIMEDOUT) means the
-// upstream received nothing, so re-attempting is safe (no double-executed job).
-// We retry only BEFORE any response byte reaches the browser, only for a small
+// internal DNS name yet. A browser request in that window fails to connect
+// (ECONNREFUSED / ENOTFOUND / EAI_AGAIN) — the upstream received nothing, so
+// re-attempting is always safe, even for a POST. A reset/timeout AFTER the
+// socket connected (ECONNRESET / ETIMEDOUT) is ambiguous: the upstream may have
+// already read the request and begun work, so replaying those risks
+// double-executing a job — we allow it only for idempotent methods. We retry
+// only BEFORE any response byte reaches the browser, only for a small
 // buffered/replayable body, and keep it bounded so a genuinely-down upstream
-// still fails fast. Set attempts to 1 to disable.
+// still fails fast. Set attempts to 1 to disable (also skips body buffering).
 const proxyRetryAttempts = Math.max(1, Number(process.env.GITNEXUS_PROXY_RETRY_ATTEMPTS || '3'));
+const proxyRetryEnabled = proxyRetryAttempts > 1;
 const proxyRetryMaxBodyBytes = Number(
   process.env.GITNEXUS_PROXY_RETRY_MAX_BODY_BYTES || String(256 * 1024),
 );
-const retryableProxyCodes = new Set([
-  'ECONNRESET',
-  'ECONNREFUSED',
-  'ENOTFOUND',
-  'EAI_AGAIN',
-  'ETIMEDOUT',
-]);
+// Connection-establishment failures: the socket never reached the upstream, so
+// it received nothing and replaying is safe for ANY method (including a POST).
+const preConnectRetryCodes = new Set(['ECONNREFUSED', 'ENOTFOUND', 'EAI_AGAIN']);
+// Post-connection failures: a reset/timeout can arrive AFTER the upstream read
+// the request and began work, so replaying a non-idempotent request risks
+// double-executing it. Retry these only for idempotent methods.
+const postConnectRetryCodes = new Set(['ECONNRESET', 'ETIMEDOUT']);
+// RFC 7231 §4.2.2 idempotent methods — safe to replay even when the upstream
+// may have already received the request.
+const idempotentMethods = new Set(['GET', 'HEAD', 'OPTIONS', 'PUT', 'DELETE', 'TRACE']);
 
 // Read a request body into a single Buffer, capping total size. Resolves null
 // if the body exceeds `cap`, the client errors mid-read, OR the read exceeds
@@ -131,10 +147,9 @@ function readBodyCapped(req, cap, timeoutMs) {
     req.on('data', onData);
     req.on('end', onEnd);
     req.on('error', onError);
-    // Idle-agnostic hard cap on how long we'll wait for the full body — the
-    // reverse-proxy equivalent of nginx's client_body_timeout. Reuses the
-    // proxyTimeoutMs knob; 0 disables it, mirroring the upstream timeout. Node's
-    // default server requestTimeout remains the outer backstop.
+    // Idle-agnostic hard cap on how long we'll wait for the full body (see
+    // proxyClientBodyTimeoutMs). 0 disables it; Node's default server
+    // requestTimeout remains the outer backstop.
     if (timeoutMs > 0) {
       timer = setTimeout(() => {
         console.warn(`[gitnexus-web] client body read timed out after ${timeoutMs}ms`);
@@ -189,18 +204,23 @@ async function proxyToUpstream(req, res) {
   headers.host = upstream.host;
 
   // Decide whether this request can be retried. A retry replays the body, so we
-  // buffer it up front — but only when it is small and its length is known:
+  // buffer it up front — but only when retry is enabled, and only when the body
+  // is small and its length is known:
   //   - GET/HEAD have no body → trivially replayable (empty buffer).
   //   - A body with a known Content-Length <= cap → buffer and retry.
   //   - Larger / unknown-length bodies (e.g. multipart uploads) → stream once
   //     with no retry, exactly as before (never buffer an upload).
+  // When retry is disabled (attempts == 1) we never buffer: bodies stream
+  // straight through as they did before this feature existed.
   const method = (req.method || 'GET').toUpperCase();
+  const isIdempotentMethod = idempotentMethods.has(method);
   const hasBody = method !== 'GET' && method !== 'HEAD';
   const len = Number(req.headers['content-length']);
-  const small = Number.isFinite(len) && len >= 0 && len <= proxyRetryMaxBodyBytes;
+  const small =
+    proxyRetryEnabled && Number.isFinite(len) && len >= 0 && len <= proxyRetryMaxBodyBytes;
   let bodyBuf = hasBody ? null : Buffer.alloc(0);
   if (hasBody && small) {
-    bodyBuf = await readBodyCapped(req, proxyRetryMaxBodyBytes, proxyTimeoutMs);
+    bodyBuf = await readBodyCapped(req, proxyRetryMaxBodyBytes, proxyClientBodyTimeoutMs);
     if (bodyBuf === null) {
       // Overflowed the cap, the client errored mid-read, or the read timed out.
       // Kept as a single 400 (not split into 408/413) — the overflow->400
@@ -237,16 +257,15 @@ async function proxyToUpstream(req, res) {
     );
     upstreamReq.on('error', (err) => {
       if (timedOut) return; // 504 already sent by the timeout handler below
-      // Retry a connect-level failure that happened before any response byte
-      // reached the browser: the upstream got nothing, so this can't
-      // double-execute a job. Once headers are sent the body is partially
-      // written and can't be replayed — fall through and destroy.
-      if (
-        retryEligible &&
-        !res.headersSent &&
-        n < proxyRetryAttempts &&
-        retryableProxyCodes.has(err.code)
-      ) {
+      // Retry only before any response byte reached the browser (once headers
+      // are sent the body is partially written and can't be replayed). A
+      // never-connected failure is always safe to replay; a reset/timeout after
+      // connecting is replayed only for an idempotent method, so a POST that the
+      // upstream may have already begun processing is never double-executed.
+      const retryableError =
+        preConnectRetryCodes.has(err.code) ||
+        (isIdempotentMethod && postConnectRetryCodes.has(err.code));
+      if (retryEligible && !res.headersSent && n < proxyRetryAttempts && retryableError) {
         const delay = 250 * 2 ** (n - 1); // 250ms, 500ms, ...
         console.warn(
           `[gitnexus-web] upstream ${err.code}; retry ${n}/${proxyRetryAttempts - 1} in ${delay}ms`,
